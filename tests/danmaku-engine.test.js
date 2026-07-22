@@ -548,6 +548,14 @@ assert.equal(
   '一倍速下超出可见时长的队列消息应正常过期'
 );
 assert.equal(
+  canvasEngine.isMessageExpired({
+    videoTime: mediaTime - 100,
+    __ydSpawnAtEntry: true
+  }),
+  false,
+  '明确延后并从右侧入场的消息不应因原视频时间而被提前丢弃'
+);
+assert.equal(
   Object.hasOwn(canvasEngine.active[0], 'element'),
   false,
   '活动弹幕不应再持有独立 DOM 元素'

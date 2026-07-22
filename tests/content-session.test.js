@@ -29,6 +29,7 @@ const context = vm.createContext({
 vm.runInContext(source, context, { filename: 'content.js' });
 
 const {
+  ChatFrameBridge,
   getVideoIdFromUrl,
   isValidChatMessagePayload,
   normalizeSettings,
@@ -39,6 +40,82 @@ const {
 assert.equal(parseChatReplayTimestamp('4:03:01'), 14581, '回放聊天时间应解析为视频秒数');
 assert.equal(parseChatReplayTimestamp('03:01'), 181, '短于一小时的回放时间也应正确解析');
 assert.equal(parseChatReplayTimestamp('直播中'), null, '非回放时间文本不应被误解析');
+assert.match(
+  source,
+  /this\.observer\.observe\(list, \{ childList: true, subtree: false \}\)/,
+  '聊天列表观察器应只监听直接子元素，避免内部 DOM 变化反复触发解析'
+);
+assert.doesNotMatch(source, /bodyObserver/, '聊天桥接不应再观察整个聊天文档子树');
+
+context.Node = { ELEMENT_NODE: 1, TEXT_NODE: 3 };
+const bridgePosts = [];
+window.postMessage = (message) => {
+  bridgePosts.push(message);
+};
+const createFakeChatRenderer = (id, text, timestamp) => {
+  const messageElement = {
+    childNodes: [{ nodeType: context.Node.TEXT_NODE, textContent: text }]
+  };
+  return {
+    id,
+    nodeType: context.Node.ELEMENT_NODE,
+    getAttribute() {
+      return null;
+    },
+    matches(selector) {
+      return selector.includes('yt-live-chat-text-message-renderer');
+    },
+    querySelector(selector) {
+      if (selector === '#message, #header-subtext') return messageElement;
+      if (selector === '#author-name') return { textContent: 'viewer' };
+      if (selector === '#timestamp') return { textContent: timestamp };
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+};
+const bridge = new ChatFrameBridge();
+bridge.now = () => 0;
+bridge.scheduleDrain = () => {};
+for (let index = 0; index < 5; index += 1) {
+  bridge.queueRenderer(createFakeChatRenderer(
+    `bridge-${index}`,
+    `分片评论 ${index}`,
+    `4:03:0${index}`
+  ));
+}
+assert.equal(bridge.pendingWork.length, 5, 'MutationObserver 收集阶段不应同步解析评论');
+assert.equal(bridgePosts.length, 0, '收集新增节点时不应逐条发送 postMessage');
+bridge.drainQueue();
+bridge.drainQueue();
+bridge.drainQueue();
+assert.deepEqual(
+  bridgePosts.map((message) => message.payloads.length),
+  [2, 2, 1],
+  '聊天评论应按每批最多两条分片解析并批量发送'
+);
+assert.ok(
+  bridgePosts.every((message) => message.type === 'chat-message-batch'),
+  '聊天 iframe 应使用批量消息协议减少跨窗口事件数量'
+);
+assert.equal(bridge.pendingWork.length, 0, '所有分片最终都应完整排空');
+
+let delayedRendererReady = false;
+const delayedRenderer = createFakeChatRenderer('bridge-delayed', '延迟填充评论', '4:03:05');
+const delayedQuerySelector = delayedRenderer.querySelector.bind(delayedRenderer);
+delayedRenderer.isConnected = true;
+delayedRenderer.querySelector = (selector) => {
+  if (selector === '#message, #header-subtext' && !delayedRendererReady) return null;
+  return delayedQuerySelector(selector);
+};
+bridge.queueRenderer(delayedRenderer);
+bridge.drainQueue();
+assert.equal(bridge.pendingWork.length, 1, '尚未填充内容的 renderer 应延后到下一任务重试');
+delayedRendererReady = true;
+bridge.drainQueue();
+assert.equal(bridgePosts.at(-1).payloads[0].id, 'bridge-delayed', '延迟填充的评论最终不应丢失');
 
 assert.equal(
   getVideoIdFromUrl('https://www.youtube.com/watch?v=current-video&t=30'),
@@ -315,6 +392,52 @@ messageApp.handleWindowMessage({
   }
 });
 assert.equal(handledMessage?.id, 'current', '当前视频的聊天消息应正常进入弹幕引擎');
+const batchHandledMessages = [];
+messageApp.handleChatMessage = (message) => {
+  batchHandledMessages.push(message);
+};
+messageApp.handleWindowMessage({
+  origin: location.origin,
+  source: chatSource,
+  data: {
+    source: 'youtube-danmaku-extension',
+    type: 'chat-message-batch',
+    payloads: [
+      {
+        id: 'batch-1',
+        videoId: 'next-video',
+        text: '批次一',
+        segments: [{ type: 'text', text: '批次一' }]
+      },
+      { id: 'invalid-batch-item', text: '缺少片段' },
+      {
+        id: 'batch-2',
+        videoId: 'next-video',
+        text: '批次二',
+        segments: [{ type: 'text', text: '批次二' }]
+      }
+    ],
+    diagnostics: {
+      queuedRenderers: 3,
+      processedRenderers: 2,
+      queuedWork: 1,
+      unexpectedField: 999
+    }
+  }
+});
+assert.deepEqual(
+  batchHandledMessages.map((message) => message.id),
+  ['batch-1', 'batch-2'],
+  '批量消息应逐条校验，单条无效内容不应导致整个批次丢失'
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(messageApp.bridgeDiagnostics)),
+  { queuedRenderers: 3, processedRenderers: 2, queuedWork: 1 },
+  '顶层页面只应保留受支持的桥接性能诊断字段'
+);
+messageApp.handleChatMessage = (message) => {
+  handledMessage = message;
+};
 let readyRefreshes = 0;
 messageApp.chatRefreshPending = true;
 messageApp.refreshChatReplay = () => {

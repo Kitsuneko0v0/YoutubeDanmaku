@@ -20,6 +20,12 @@
   });
   const SETTINGS_SAVE_DELAY_MS = 250;
   const CHAT_REPLAY_LATE_TOLERANCE_SECONDS = 3;
+  const CHAT_BRIDGE_MAX_MESSAGES_PER_SLICE = 2;
+  const CHAT_BRIDGE_PARSE_BUDGET_MS = 2;
+  const CHAT_BRIDGE_MAX_BATCH_MESSAGES = 4;
+  const CHAT_BRIDGE_MAX_PENDING_WORK = 1000;
+  const CHAT_BRIDGE_MAX_INCOMPLETE_RETRIES = 4;
+  const CHAT_BRIDGE_REATTACH_INTERVAL_MS = 1000;
   const FONT_FAMILIES = new Set([
     'sans-serif',
     'Arial, sans-serif',
@@ -112,6 +118,34 @@
     if (numbers.some((part) => !Number.isInteger(part) || part < 0)) return null;
     if (numbers.slice(1).some((part) => part >= 60)) return null;
     return numbers.reduce((total, part) => total * 60 + part, 0);
+  }
+
+  function getMonotonicTime() {
+    return typeof globalThis.performance?.now === 'function'
+      ? globalThis.performance.now()
+      : Date.now();
+  }
+
+  function createChatBridgeDiagnostics() {
+    return {
+      mutationCallbacks: 0,
+      maxMutationBatchSize: 0,
+      queuedRenderers: 0,
+      processedRenderers: 0,
+      parseAttempts: 0,
+      incompleteRetries: 0,
+      duplicateNodes: 0,
+      invalidMessages: 0,
+      wrapperScans: 0,
+      slices: 0,
+      totalParseMs: 0,
+      maxParseMs: 0,
+      maxSliceMs: 0,
+      queuePeak: 0,
+      postedMessages: 0,
+      postedBatches: 0,
+      overflowed: 0
+    };
   }
 
   function isValidChatMessagePayload(payload) {
@@ -274,35 +308,56 @@
     constructor() {
       this.seen = new Set();
       this.observer = null;
-      this.bodyObserver = null;
+      this.containerObserver = null;
+      this.connectionTimer = null;
+      this.drainTimer = null;
+      this.pendingWork = [];
+      this.queuedRenderers = new WeakSet();
+      this.queuedScans = new WeakSet();
+      this.diagnostics = createChatBridgeDiagnostics();
       this.sequence = 1;
     }
 
     start() {
       this.findAndObserve();
-      this.bodyObserver = new MutationObserver(() => {
+      this.connectionTimer = setInterval(() => {
         if (!this.observer?.target?.isConnected) this.findAndObserve();
-      });
-      this.bodyObserver.observe(document.documentElement, { childList: true, subtree: true });
+      }, CHAT_BRIDGE_REATTACH_INTERVAL_MS);
     }
 
     findAndObserve() {
       const list = document.querySelector('yt-live-chat-item-list-renderer #items, #items.yt-live-chat-item-list-renderer');
       if (!list || this.observer?.target === list) return;
       this.observer?.disconnect();
+      this.containerObserver?.disconnect();
 
-      Array.from(list.querySelectorAll(CHAT_SELECTOR)).slice(-30).forEach((node) => this.forward(node));
+      Array.from(list.querySelectorAll(CHAT_SELECTOR))
+        .slice(-30)
+        .forEach((node) => this.queueRenderer(node));
       this.observer = new MutationObserver((records) => {
+        let addedElements = 0;
+        this.diagnostics.mutationCallbacks += 1;
         records.forEach((record) => {
           record.addedNodes.forEach((node) => {
             if (node.nodeType !== Node.ELEMENT_NODE) return;
-            if (node.matches?.(CHAT_SELECTOR)) this.forward(node);
-            node.querySelectorAll?.(CHAT_SELECTOR).forEach((child) => this.forward(child));
+            addedElements += 1;
+            this.queueAddedNode(node);
           });
         });
+        this.diagnostics.maxMutationBatchSize = Math.max(
+          this.diagnostics.maxMutationBatchSize,
+          addedElements
+        );
       });
       this.observer.target = list;
-      this.observer.observe(list, { childList: true, subtree: true });
+      this.observer.observe(list, { childList: true, subtree: false });
+
+      if (list.parentElement) {
+        this.containerObserver = new MutationObserver(() => {
+          if (!list.isConnected) this.findAndObserve();
+        });
+        this.containerObserver.observe(list.parentElement, { childList: true, subtree: false });
+      }
       window.top.postMessage({
         source: MESSAGE_SOURCE,
         type: 'chat-ready',
@@ -310,10 +365,116 @@
       }, location.origin);
     }
 
-    forward(node) {
+    now() {
+      return getMonotonicTime();
+    }
+
+    queueAddedNode(node) {
+      if (node.matches?.(CHAT_SELECTOR)) {
+        this.queueRenderer(node);
+        return;
+      }
+      if (this.queuedScans.has(node)) return;
+      this.queuedScans.add(node);
+      this.pushWork({ type: 'scan', node });
+    }
+
+    queueRenderer(node, prepend = false, schedule = true) {
+      if (!node || this.queuedRenderers.has(node)) {
+        if (node) this.diagnostics.duplicateNodes += 1;
+        return;
+      }
+      this.queuedRenderers.add(node);
+      this.diagnostics.queuedRenderers += 1;
+      this.pushWork({ type: 'renderer', node, attempts: 0 }, prepend, schedule);
+    }
+
+    pushWork(work, prepend = false, schedule = true) {
+      if (prepend) this.pendingWork.unshift(work);
+      else this.pendingWork.push(work);
+      if (this.pendingWork.length > CHAT_BRIDGE_MAX_PENDING_WORK) {
+        if (prepend) this.pendingWork.pop();
+        else this.pendingWork.shift();
+        this.diagnostics.overflowed += 1;
+      }
+      this.diagnostics.queuePeak = Math.max(
+        this.diagnostics.queuePeak,
+        this.pendingWork.length
+      );
+      if (schedule) this.scheduleDrain();
+    }
+
+    scheduleDrain() {
+      if (this.drainTimer != null) return;
+      this.drainTimer = setTimeout(() => this.drainQueue(), 0);
+    }
+
+    drainQueue() {
+      this.drainTimer = null;
+      const startedAt = this.now();
+      const payloads = [];
+      let processedRenderers = 0;
+      let processedWork = 0;
+      let shouldYield = false;
+
+      while (this.pendingWork.length) {
+        const work = this.pendingWork.shift();
+        processedWork += 1;
+        if (work.type === 'scan') {
+          this.diagnostics.wrapperScans += 1;
+          const renderers = Array.from(work.node.querySelectorAll?.(CHAT_SELECTOR) || []);
+          for (let index = renderers.length - 1; index >= 0; index -= 1) {
+            this.queueRenderer(renderers[index], true, false);
+          }
+        } else {
+          const parseStartedAt = this.now();
+          const result = this.parseNode(work.node);
+          const parseMs = Math.max(0, this.now() - parseStartedAt);
+          this.diagnostics.parseAttempts += 1;
+          this.diagnostics.totalParseMs += parseMs;
+          this.diagnostics.maxParseMs = Math.max(this.diagnostics.maxParseMs, parseMs);
+          if (
+            result.incomplete
+            && work.node.isConnected
+            && work.attempts < CHAT_BRIDGE_MAX_INCOMPLETE_RETRIES
+          ) {
+            work.attempts += 1;
+            this.pendingWork.push(work);
+            this.diagnostics.incompleteRetries += 1;
+            shouldYield = true;
+          } else {
+            if (result.incomplete) this.diagnostics.invalidMessages += 1;
+            this.diagnostics.processedRenderers += 1;
+            processedRenderers += 1;
+            if (result.payload) payloads.push(result.payload);
+          }
+        }
+
+        const elapsed = this.now() - startedAt;
+        if (
+          processedRenderers >= CHAT_BRIDGE_MAX_MESSAGES_PER_SLICE
+          || (processedWork > 0 && elapsed >= CHAT_BRIDGE_PARSE_BUDGET_MS)
+          || shouldYield
+        ) break;
+      }
+
+      const sliceMs = Math.max(0, this.now() - startedAt);
+      this.diagnostics.slices += 1;
+      this.diagnostics.maxSliceMs = Math.max(this.diagnostics.maxSliceMs, sliceMs);
+      if (payloads.length) this.postBatch(payloads);
+      if (this.pendingWork.length) this.scheduleDrain();
+    }
+
+    parseNode(node) {
+      if (node.id && this.seen.has(node.id)) {
+        this.diagnostics.duplicateNodes += 1;
+        return { incomplete: false, payload: null };
+      }
       const messageElement = node.querySelector('#message, #header-subtext');
       const segments = extractMessageSegments(messageElement);
-      if (!segments.length) return;
+      if (!segments.length) {
+        return { incomplete: true, payload: null };
+      }
       const text = segments
         .map((segment) => segment.type === 'text' ? segment.text : segment.alt)
         .join('')
@@ -323,7 +484,10 @@
       const authorElement = node.querySelector('#author-name');
       const authorName = authorElement?.textContent?.trim() || '';
       const id = node.id || `${authorName}:${text || '[emoji]'}:${this.sequence++}`;
-      if (this.seen.has(id)) return;
+      if (this.seen.has(id)) {
+        this.diagnostics.duplicateNodes += 1;
+        return { incomplete: false, payload: null };
+      }
       this.seen.add(id);
       if (this.seen.size > 600) this.seen.delete(this.seen.values().next().value);
 
@@ -340,9 +504,8 @@
         node.querySelector('#timestamp')?.textContent || ''
       );
 
-      window.top.postMessage({
-        source: MESSAGE_SOURCE,
-        type: 'chat-message',
+      return {
+        incomplete: false,
         payload: {
           id,
           videoId: getCurrentVideoId(),
@@ -356,6 +519,21 @@
             ? authorStyle?.color || '#075e54'
             : authorStyle?.backgroundColor || '#b91c1c',
           color
+        }
+      };
+    }
+
+    postBatch(payloads) {
+      const batch = payloads.slice(0, CHAT_BRIDGE_MAX_BATCH_MESSAGES);
+      this.diagnostics.postedMessages += batch.length;
+      this.diagnostics.postedBatches += 1;
+      window.top.postMessage({
+        source: MESSAGE_SOURCE,
+        type: 'chat-message-batch',
+        payloads: batch,
+        diagnostics: {
+          ...this.diagnostics,
+          queuedWork: this.pendingWork.length
         }
       }, location.origin);
     }
@@ -385,6 +563,7 @@
       this.seenMessages = new Set();
       this.timelineMessages = [];
       this.pendingMessages = [];
+      this.bridgeDiagnostics = null;
       this.lastObservedMediaTime = null;
       this.lastObservedMediaAt = null;
       this.handleWindowMessage = this.handleWindowMessage.bind(this);
@@ -450,6 +629,7 @@
       this.stage.className = 'yd-danmaku-stage';
       this.stage.setAttribute('aria-hidden', 'true');
       player.prepend(this.stage);
+      this.publishChatBridgeDiagnostics();
 
       this.controls = this.createControls();
       rightControls.prepend(this.controls);
@@ -818,19 +998,68 @@
         ) this.refreshChatReplay();
         return;
       }
+
+      if (event.data?.type === 'chat-message-batch') {
+        if (
+          !Array.isArray(event.data.payloads)
+          || event.data.payloads.length > CHAT_BRIDGE_MAX_BATCH_MESSAGES
+        ) return;
+        this.updateChatBridgeDiagnostics(event.data.diagnostics);
+        event.data.payloads.forEach((payload) => this.handleIncomingChatPayload(payload));
+        return;
+      }
       if (event.data?.type !== 'chat-message') return;
-      if (!isValidChatMessagePayload(event.data.payload)) return;
+      this.handleIncomingChatPayload(event.data.payload);
+    }
+
+    handleIncomingChatPayload(payload) {
+      if (!isValidChatMessagePayload(payload)) return;
       const currentVideoId = getCurrentVideoId();
       if (this.videoId !== currentVideoId || !this.engine) {
-        const messageVideoId = event.data.payload.videoId || currentVideoId;
+        const messageVideoId = payload.videoId || currentVideoId;
         if (messageVideoId === currentVideoId) {
-          this.queuePendingMessage(event.data.payload, currentVideoId);
+          this.queuePendingMessage(payload, currentVideoId);
         }
         this.scheduleMount();
         return;
       }
-      if (event.data.payload?.videoId && event.data.payload.videoId !== currentVideoId) return;
-      this.handleChatMessage(event.data.payload);
+      if (payload.videoId && payload.videoId !== currentVideoId) return;
+      this.handleChatMessage(payload);
+    }
+
+    updateChatBridgeDiagnostics(value) {
+      if (!value || typeof value !== 'object') return;
+      const normalized = {};
+      [
+        'mutationCallbacks',
+        'maxMutationBatchSize',
+        'queuedRenderers',
+        'processedRenderers',
+        'parseAttempts',
+        'incompleteRetries',
+        'duplicateNodes',
+        'invalidMessages',
+        'wrapperScans',
+        'slices',
+        'totalParseMs',
+        'maxParseMs',
+        'maxSliceMs',
+        'queuePeak',
+        'queuedWork',
+        'postedMessages',
+        'postedBatches',
+        'overflowed'
+      ].forEach((key) => {
+        const number = Number(value[key]);
+        if (Number.isFinite(number) && number >= 0) normalized[key] = number;
+      });
+      this.bridgeDiagnostics = normalized;
+      this.publishChatBridgeDiagnostics();
+    }
+
+    publishChatBridgeDiagnostics() {
+      if (!this.stage || !this.bridgeDiagnostics) return;
+      this.stage.dataset.bridgeDiagnostics = JSON.stringify(this.bridgeDiagnostics);
     }
 
     handleChatMessage(message) {

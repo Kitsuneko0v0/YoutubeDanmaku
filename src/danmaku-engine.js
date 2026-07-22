@@ -598,6 +598,7 @@
     }
 
     isMessageExpired(message, currentTime = this.getMediaTime()) {
+      if (message?.__ydSpawnAtEntry) return false;
       const messageTime = Number(message?.videoTime);
       const stageWidth = this.stage.clientWidth;
       if (
