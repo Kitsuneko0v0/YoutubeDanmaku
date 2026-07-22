@@ -273,15 +273,11 @@ assert.equal(
   1,
   '居中合并弹幕占用的轨道应阻止新的滚动弹幕进入'
 );
-assert.equal(getFixedMergeLaneLimit(2), 1, '低轨道数时只应开放一条居中合并轨道');
-assert.equal(getFixedMergeLaneLimit(8), 2, '居中合并轨道最多占总轨道数的四分之一');
-assert.equal(getFixedMergeLaneLimit(12), 3, '十二条轨道时应开放三条居中合并轨道');
-assert.equal(getFixedMergeLaneLimit(20), 4, '居中合并轨道数量应限制在四条以内');
-assert.equal(
-  getFixedMergeLaneLimit(8, 8),
-  4,
-  '临时轨道能够补偿容量时应允许最多四条居中弹幕'
-);
+assert.equal(getFixedMergeLaneLimit(25, 20), 2, '25% 显示区域应最多开放两条中置弹幕');
+assert.equal(getFixedMergeLaneLimit(50, 20), 3, '50% 显示区域应最多开放三条中置弹幕');
+assert.equal(getFixedMergeLaneLimit(75, 20), 4, '75% 显示区域应最多开放四条中置弹幕');
+assert.equal(getFixedMergeLaneLimit(100, 20), 5, '100% 显示区域应最多开放五条中置弹幕');
+assert.equal(getFixedMergeLaneLimit(25, 1), 1, '实际基础轨道不足时不应分配不存在的中置行');
 assert.equal(
   getTemporaryLaneExpansion(50, 8, 16, 3),
   3,
@@ -295,7 +291,12 @@ assert.equal(
 assert.equal(
   getTemporaryLaneExpansion(75, 12, 14, 4),
   2,
-  '临时轨道扩展不应超过播放器实际可容纳的总行数'
+  '四条中置弹幕只有两行剩余空间时应只拓展两行'
+);
+assert.equal(
+  getFixedMergeLaneLimit(50, 8),
+  3,
+  '拓展空间不足不应降低显示占比规定的中置弹幕上限'
 );
 
 const simulatedStageWidth = 1200;
@@ -526,8 +527,8 @@ const canvasEngine = new DanmakuEngine(fakeStage, {
 });
 assert.equal(
   canvasEngine.getFixedLaneLimit(),
-  4,
-  '非百分百显示区域应利用临时扩展容量开放四条中置轨道'
+  3,
+  '50% 显示区域应按固定规则开放三条中置轨道'
 );
 canvasEngine.setMediaClock(() => mediaTime);
 canvasEngine.setPlaybackRate(2);

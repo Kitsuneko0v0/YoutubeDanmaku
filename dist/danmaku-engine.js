@@ -21,7 +21,13 @@
   const BILIBILI_COMMON_DURATION = 3.8;
   const BILIBILI_MIN_DURATION = 4;
   const BILIBILI_MAX_DURATION = 9;
-  const FIXED_MERGE_MAX_LANES = 4;
+  const FIXED_MERGE_LANE_LIMITS = Object.freeze({
+    25: 2,
+    50: 3,
+    75: 4,
+    100: 5
+  });
+  const FIXED_MERGE_MAX_LANES = 5;
   const REPEAT_COUNTER_PULSE_SECONDS = 0.32;
   const MAX_MESSAGES_PER_FRAME = 4;
   const MAX_MESSAGES_PER_ANIMATION_FRAME = 1;
@@ -188,13 +194,16 @@
     return parts.length ? parts.join('\u001f') : null;
   }
 
-  function getFixedMergeLaneLimit(laneCount, temporaryLaneCapacity = null) {
+  function getFixedMergeLaneLimit(area, laneCount) {
+    const parsedArea = Number(area);
+    const normalizedArea = Math.min(
+      100,
+      Math.max(25, Number.isFinite(parsedArea) ? parsedArea : DEFAULT_ENGINE_OPTIONS.area)
+    );
+    const areaStep = Math.min(100, Math.max(25, Math.round(normalizedArea / 25) * 25));
+    const configuredLimit = FIXED_MERGE_LANE_LIMITS[areaStep];
     const count = Math.max(1, Math.floor(Number(laneCount) || 1));
-    if (temporaryLaneCapacity != null) {
-      const capacity = Math.max(0, Math.floor(Number(temporaryLaneCapacity) || 0));
-      return Math.min(FIXED_MERGE_MAX_LANES, count, capacity);
-    }
-    return Math.min(FIXED_MERGE_MAX_LANES, Math.max(1, Math.ceil(count * 0.25)));
+    return Math.min(configuredLimit, count);
   }
 
   function getTemporaryLaneExpansion(area, baseLaneCount, fullLaneCount, fixedCount) {
@@ -516,14 +525,7 @@
     }
 
     getFixedLaneLimit() {
-      const baseLaneCount = this.getBaseLaneCount();
-      if (Number(this.options.area) >= 100) {
-        return getFixedMergeLaneLimit(baseLaneCount);
-      }
-      return getFixedMergeLaneLimit(
-        baseLaneCount,
-        this.getFullLaneCount() - baseLaneCount
-      );
+      return getFixedMergeLaneLimit(this.options.area, this.getBaseLaneCount());
     }
 
     updateStageHeight() {
