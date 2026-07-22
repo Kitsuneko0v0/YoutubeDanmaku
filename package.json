@@ -1,0 +1,10 @@
+{
+  "name": "youtube-live-danmaku",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Display YouTube live comments as configurable danmaku.",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node tests/i18n.test.js && node tests/content-session.test.js && node tests/danmaku-engine.test.js"
+  }
+}

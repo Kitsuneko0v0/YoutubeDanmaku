@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube 弹幕扩展界面测试</title>
+  <link rel="stylesheet" href="../src/content.css">
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { align-items: center; background: #0f0f0f; display: flex; font-family: Arial, sans-serif; justify-content: center; }
+    body.yd-light-test { background: #f9f9f9; }
+    #movie_player { aspect-ratio: 16 / 9; background: radial-gradient(circle at 68% 22%, #38536f, transparent 24%), linear-gradient(145deg, #152534, #07090d 70%); box-shadow: 0 24px 80px #000; max-height: 90vh; overflow: hidden; position: relative; width: min(1200px, 92vw); }
+    .mock-title { color: rgba(255,255,255,.72); font-size: clamp(28px, 5vw, 64px); font-weight: 700; left: 6%; position: absolute; top: 16%; }
+    .mock-subtitle { color: rgba(255,255,255,.45); font-size: 18px; left: 6.3%; position: absolute; top: 31%; }
+    .ytp-right-controls { align-items: center; background: linear-gradient(transparent, rgba(0,0,0,.88)); bottom: 0; display: flex; height: 54px; justify-content: flex-end; left: 0; position: absolute; right: 0; }
+    .ytp-button { background: transparent; border: 0; cursor: pointer; }
+    .mock-control { background: transparent; border: 0; color: rgba(255,255,255,.72); font-size: 12px; height: 100%; padding: 0 10px; }
+    .mock-control:hover { color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="movie_player">
+    <div class="mock-title">YouTube Live</div>
+    <div class="mock-subtitle">弹幕设置与高密度轨道预览</div>
+    <video></video>
+    <div class="ytp-right-controls">
+      <button class="mock-control" id="mock-send" type="button">发送测试弹幕</button>
+      <button class="mock-control" id="mock-rate" type="button">模拟 2×</button>
+      <button class="mock-control" id="mock-seek-back" type="button">快退 2.5 秒</button>
+      <button class="mock-control" id="mock-seek-forward" type="button">快进 2.5 秒</button>
+      <button class="mock-control" id="mock-pause" type="button">暂停测试</button>
+    </div>
+  </div>
+  <script src="../src/danmaku-engine.js"></script>
+  <script src="../src/i18n.js"></script>
+  <script src="../src/content.js"></script>
+  <script>
+    if (new URLSearchParams(location.search).get('theme') === 'light') {
+      document.body.classList.add('yd-light-test');
+    }
+    const player = document.querySelector('#movie_player');
+    const app = new YTDanmakuExtension.YouTubeDanmakuApp();
+    app.mountElements(player, player.querySelector('.ytp-right-controls'), player.querySelector('video'));
+    let mockVideoTime = 100;
+    app.engine.setMediaClock(() => mockVideoTime);
+    app.engine.setPaused(false);
+    let mockPlaybackRate = 1;
+    let lastClockTimestamp = performance.now();
+    requestAnimationFrame(function advanceMockClock(timestamp) {
+      if (!app.engine.paused) {
+        mockVideoTime += ((timestamp - lastClockTimestamp) / 1000) * mockPlaybackRate;
+      }
+      lastClockTimestamp = timestamp;
+      requestAnimationFrame(advanceMockClock);
+    });
+    [
+      { id: '1', text: '这个画面太漂亮了', role: 'viewer' },
+      { id: '2', text: '欢迎来到直播间', role: 'moderator', authorName: 'LiveMod', authorColor: '#fff', authorBackground: '#0b8f83' },
+      { id: '3', text: '实时评论会从右向左播放', role: 'owner', authorName: 'Channel', authorColor: '#fff', authorBackground: '#c62828' },
+      { id: '4', text: '暂停视频后弹幕会停在原位', role: 'viewer' },
+      { id: '5', text: '支持 Windows 与 macOS', role: 'viewer' },
+      {
+        id: '6',
+        text: '会员表情 :member:',
+        role: 'viewer',
+        segments: [
+          { type: 'text', text: '会员表情 ' },
+          { type: 'emoji', src: 'https://www.youtube.com/favicon.ico', alt: ':member:' }
+        ]
+      }
+    ].forEach((message, index) => app.handleChatMessage({
+      ...message,
+      videoTime: mockVideoTime - (5 - index) * 0.7
+    }));
+    let sequence = 10;
+    document.querySelector('#mock-send').addEventListener('click', () => {
+      app.handleChatMessage({
+        id: String(sequence++),
+        text: '暂停位置验证弹幕 :member:',
+        role: 'viewer',
+        videoTime: mockVideoTime,
+        segments: [
+          { type: 'text', text: '暂停位置验证弹幕 ' },
+          { type: 'emoji', src: 'https://www.youtube.com/favicon.ico', alt: ':member:' }
+        ]
+      });
+    });
+    document.querySelector('#mock-rate').addEventListener('click', (event) => {
+      mockPlaybackRate = mockPlaybackRate === 1 ? 2 : 1;
+      event.currentTarget.textContent = mockPlaybackRate === 1 ? '模拟 2×' : '恢复 1×';
+    });
+    document.querySelector('#mock-seek-back').addEventListener('click', () => {
+      mockVideoTime -= 2.5;
+      app.engine.rebuildAtTime(app.timelineMessages, mockVideoTime);
+    });
+    document.querySelector('#mock-seek-forward').addEventListener('click', () => {
+      mockVideoTime += 2.5;
+      app.engine.rebuildAtTime(app.timelineMessages, mockVideoTime);
+    });
+    document.querySelector('#mock-pause').addEventListener('click', (event) => {
+      const shouldPause = event.currentTarget.textContent === '暂停测试';
+      event.currentTarget.textContent = shouldPause ? '继续测试' : '暂停测试';
+      const video = player.querySelector('video');
+      video.dispatchEvent(new Event(shouldPause ? 'pause' : 'playing'));
+      if (shouldPause) video.dispatchEvent(new Event('timeupdate'));
+    });
+    setTimeout(() => app.setPanelOpen(true), 250);
+  </script>
+</body>
+</html>
