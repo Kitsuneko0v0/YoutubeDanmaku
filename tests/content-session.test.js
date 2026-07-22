@@ -66,7 +66,7 @@ const createFakeChatRenderer = (id, text, timestamp) => {
       return selector.includes('yt-live-chat-text-message-renderer');
     },
     querySelector(selector) {
-      if (selector === '#message, #header-subtext') return messageElement;
+      if (selector === '#message') return messageElement;
       if (selector === '#author-name') return { textContent: 'viewer' };
       if (selector === '#timestamp') return { textContent: timestamp };
       return null;
@@ -107,7 +107,7 @@ const delayedRenderer = createFakeChatRenderer('bridge-delayed', '延迟填充�
 const delayedQuerySelector = delayedRenderer.querySelector.bind(delayedRenderer);
 delayedRenderer.isConnected = true;
 delayedRenderer.querySelector = (selector) => {
-  if (selector === '#message, #header-subtext' && !delayedRendererReady) return null;
+  if (selector === '#message' && !delayedRendererReady) return null;
   return delayedQuerySelector(selector);
 };
 bridge.queueRenderer(delayedRenderer);
@@ -116,6 +116,43 @@ assert.equal(bridge.pendingWork.length, 1, '尚未填充内容的 renderer 应�
 delayedRendererReady = true;
 bridge.drainQueue();
 assert.equal(bridgePosts.at(-1).payloads[0].id, 'bridge-delayed', '延迟填充的评论最终不应丢失');
+
+const membershipPosts = [];
+const originalPostMessage = window.postMessage;
+window.postMessage = (message) => {
+  membershipPosts.push(message);
+};
+const membershipBridge = new ChatFrameBridge();
+membershipBridge.now = () => 0;
+membershipBridge.scheduleDrain = () => {};
+membershipBridge.queueAddedNode({
+  id: 'membership-announcement',
+  nodeType: context.Node.ELEMENT_NODE,
+  getAttribute() {
+    return null;
+  },
+  matches(selector) {
+    return selector.includes('yt-live-chat-membership-item-renderer');
+  },
+  querySelector(selector) {
+    if (selector === '#header-subtext') {
+      return {
+        childNodes: [{
+          nodeType: context.Node.TEXT_NODE,
+          textContent: '欢迎加入会员！'
+        }]
+      };
+    }
+    if (selector === '#author-name') return { textContent: 'new member' };
+    return null;
+  },
+  querySelectorAll() {
+    return [];
+  }
+});
+membershipBridge.drainQueue();
+window.postMessage = originalPostMessage;
+assert.equal(membershipPosts.length, 0, '加入会员公告不应被转发为弹幕');
 
 assert.equal(
   getVideoIdFromUrl('https://www.youtube.com/watch?v=current-video&t=30'),

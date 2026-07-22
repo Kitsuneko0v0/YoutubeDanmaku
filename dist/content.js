@@ -470,7 +470,14 @@
         this.diagnostics.duplicateNodes += 1;
         return { incomplete: false, payload: null };
       }
-      const messageElement = node.querySelector('#message, #header-subtext');
+      const messageElement = node.querySelector('#message');
+      if (
+        !messageElement
+        && node.matches('yt-live-chat-membership-item-renderer')
+        && node.querySelector('#header-subtext')
+      ) {
+        return { incomplete: false, payload: null };
+      }
       const segments = extractMessageSegments(messageElement);
       if (!segments.length) {
         return { incomplete: true, payload: null };

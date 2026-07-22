@@ -21,7 +21,7 @@
   const BILIBILI_COMMON_DURATION = 3.8;
   const BILIBILI_MIN_DURATION = 4;
   const BILIBILI_MAX_DURATION = 9;
-  const FIXED_MERGE_MAX_LANES = 3;
+  const FIXED_MERGE_MAX_LANES = 4;
   const REPEAT_COUNTER_PULSE_SECONDS = 0.32;
   const MAX_MESSAGES_PER_FRAME = 4;
   const MAX_MESSAGES_PER_ANIMATION_FRAME = 1;
@@ -188,9 +188,25 @@
     return parts.length ? parts.join('\u001f') : null;
   }
 
-  function getFixedMergeLaneLimit(laneCount) {
+  function getFixedMergeLaneLimit(laneCount, temporaryLaneCapacity = null) {
     const count = Math.max(1, Math.floor(Number(laneCount) || 1));
+    if (temporaryLaneCapacity != null) {
+      const capacity = Math.max(0, Math.floor(Number(temporaryLaneCapacity) || 0));
+      return Math.min(FIXED_MERGE_MAX_LANES, count, capacity);
+    }
     return Math.min(FIXED_MERGE_MAX_LANES, Math.max(1, Math.ceil(count * 0.25)));
+  }
+
+  function getTemporaryLaneExpansion(area, baseLaneCount, fullLaneCount, fixedCount) {
+    const normalizedArea = Math.min(100, Math.max(0, Number(area) || 0));
+    if (normalizedArea >= 100) return 0;
+    const baseCount = Math.max(1, Math.floor(Number(baseLaneCount) || 1));
+    const fullCount = Math.max(baseCount, Math.floor(Number(fullLaneCount) || baseCount));
+    const requestedCount = Math.min(
+      FIXED_MERGE_MAX_LANES,
+      Math.max(0, Math.floor(Number(fixedCount) || 0))
+    );
+    return Math.min(requestedCount, fullCount - baseCount);
   }
 
   function calculateDanmakuX(stageWidth, velocity, currentTime, startTime) {
@@ -293,7 +309,7 @@
     applyOptions(nextOptions) {
       this.options = { ...this.options, ...nextOptions };
       const opacity = getOpacityChannels(this.options.opacity);
-      this.stage.style.height = `${this.options.area}%`;
+      this.updateStageHeight();
       this.stage.style.opacity = '1';
       this.stage.style.setProperty('--yd-element-opacity', String(opacity.fill));
       this.stage.style.setProperty('--yd-fill-opacity', `${opacity.fill * 100}%`);
@@ -455,8 +471,74 @@
       return Math.max(20, Math.ceil(this.options.fontSize * 1.35));
     }
 
+    getBaseLaneCount() {
+      const lineHeight = this.getLineHeight();
+      const parentHeight = Number(this.stage.parentElement?.clientHeight);
+      const stageHeight = Number(this.stage.clientHeight);
+      const baseHeight = Number.isFinite(parentHeight) && parentHeight > 0
+        ? parentHeight * Math.min(100, Math.max(0, Number(this.options.area) || 0)) / 100
+        : stageHeight;
+      return Math.max(1, Math.floor(baseHeight / lineHeight));
+    }
+
+    getTemporaryLaneCount() {
+      const baseLaneCount = this.getBaseLaneCount();
+      return getTemporaryLaneExpansion(
+        this.options.area,
+        baseLaneCount,
+        this.getFullLaneCount(),
+        this.fixedActive.length
+      );
+    }
+
+    getRetainedTemporaryLaneCount() {
+      const baseLaneCount = this.getBaseLaneCount();
+      const allocatedLaneCount = this.getTemporaryLaneCount();
+      const highestOccupiedLane = this.active.reduce(
+        (highest, item) => Math.max(highest, Number(item.lane) || 0),
+        baseLaneCount - 1
+      );
+      const occupiedExtraLaneCount = Math.max(
+        0,
+        highestOccupiedLane - baseLaneCount + 1
+      );
+      return Math.min(
+        this.getFullLaneCount() - baseLaneCount,
+        Math.max(allocatedLaneCount, occupiedExtraLaneCount)
+      );
+    }
+
+    getFullLaneCount() {
+      const parentHeight = Number(this.stage.parentElement?.clientHeight);
+      return Number.isFinite(parentHeight) && parentHeight > 0
+        ? Math.max(1, Math.floor(parentHeight / this.getLineHeight()))
+        : this.getBaseLaneCount() + FIXED_MERGE_MAX_LANES;
+    }
+
+    getFixedLaneLimit() {
+      const baseLaneCount = this.getBaseLaneCount();
+      if (Number(this.options.area) >= 100) {
+        return getFixedMergeLaneLimit(baseLaneCount);
+      }
+      return getFixedMergeLaneLimit(
+        baseLaneCount,
+        this.getFullLaneCount() - baseLaneCount
+      );
+    }
+
+    updateStageHeight() {
+      const extraHeight = this.getRetainedTemporaryLaneCount() * this.getLineHeight();
+      this.stage.style.height = extraHeight > 0
+        ? `min(100%, calc(${this.options.area}% + ${extraHeight}px))`
+        : `${this.options.area}%`;
+    }
+
     getLaneCount() {
-      return Math.max(1, Math.floor(this.stage.clientHeight / this.getLineHeight()));
+      return this.getBaseLaneCount() + this.getTemporaryLaneCount();
+    }
+
+    getRenderLaneCount() {
+      return this.getBaseLaneCount() + this.getRetainedTemporaryLaneCount();
     }
 
     getLaneState() {
@@ -471,7 +553,8 @@
       }));
 
       this.active.forEach((item) => {
-        const laneIndex = Math.min(item.lane, count - 1);
+        const laneIndex = Number(item.lane);
+        if (!Number.isInteger(laneIndex) || laneIndex < 0 || laneIndex >= count) return;
         const lane = lanes[laneIndex];
         const rightEdge = item.x + item.width;
         lane.items.push(item);
@@ -626,8 +709,7 @@
     }
 
     getAvailableFixedLane() {
-      const laneCount = this.getLaneCount();
-      const laneLimit = getFixedMergeLaneLimit(laneCount);
+      const laneLimit = this.getFixedLaneLimit();
       const busyLanes = new Set(this.fixedActive.map((item) => item.lane));
       for (let lane = 0; lane < laneLimit; lane += 1) {
         if (!busyLanes.has(lane)) return lane;
@@ -704,6 +786,7 @@
       };
       group.fixedItem = fixedItem;
       this.fixedActive.push(fixedItem);
+      this.updateStageHeight();
       this.diagnostics.merged += 1;
       this.registerEmojiItem(fixedItem);
       this.requestRender();
@@ -1123,7 +1206,7 @@
       this.context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       this.context.clearRect(0, 0, width, height);
       const lineHeight = this.getLineHeight();
-      const laneCount = Math.max(1, Math.floor(height / lineHeight));
+      const laneCount = this.getRenderLaneCount();
       this.active.forEach((item) => {
         item.lane = Math.min(item.lane, laneCount - 1);
         const x = alignToDevicePixel(item.x, pixelRatio);
@@ -1182,6 +1265,7 @@
 
     reflow(rebuildSurfaces = false) {
       if (!this.stage.isConnected) return;
+      this.updateStageHeight();
       const width = this.stage.clientWidth;
       const height = this.stage.clientHeight;
       const pixelRatio = this.getPixelRatio();
@@ -1193,7 +1277,7 @@
       this.canvas.style.height = `${height}px`;
 
       const lineHeight = this.getLineHeight();
-      const laneCount = Math.max(1, Math.floor(height / lineHeight));
+      const laneCount = this.getRenderLaneCount();
       this.active.forEach((item) => {
         item.lane %= laneCount;
         if (rebuildSurfaces) {
@@ -1224,6 +1308,7 @@
       this.clearEmojiTracking();
       this.active = [];
       this.fixedActive = [];
+      this.updateStageHeight();
       this.repeatGroups.clear();
       this.normalQueue = [];
       this.priorityQueue = [];
@@ -1405,6 +1490,7 @@
       try {
         if (currentMediaTime != null) this.spawnDueTimelineMessages(currentMediaTime);
 
+        let removedRollingItem = false;
         for (let index = this.active.length - 1; index >= 0; index -= 1) {
           const item = this.active[index];
           // Media time only schedules messages and handles explicit seeks. On-screen motion
@@ -1413,8 +1499,10 @@
           if (item.x + item.width < 0) {
             this.active.splice(index, 1);
             this.unlinkRollingItem(item);
+            removedRollingItem = true;
           }
         }
+        if (removedRollingItem) this.updateStageHeight();
 
         for (let index = this.fixedActive.length - 1; index >= 0; index -= 1) {
           const item = this.fixedActive[index];
@@ -1469,6 +1557,7 @@
       if (index !== -1) {
         this.active.splice(index, 1);
         this.unlinkRollingItem(item);
+        this.updateStageHeight();
       }
       this.requestRender();
     }
@@ -1491,6 +1580,7 @@
       this.unregisterEmojiItem(item);
       const index = this.fixedActive.indexOf(item);
       if (index !== -1) this.fixedActive.splice(index, 1);
+      this.updateStageHeight();
       const group = this.repeatGroups.get(item.duplicateKey);
       if (group?.fixedItem === item) this.repeatGroups.delete(item.duplicateKey);
       if (shouldRender) this.requestRender();
@@ -1527,6 +1617,7 @@
     getAvailableLane,
     getDuplicateKey,
     getFixedMergeLaneLimit,
+    getTemporaryLaneExpansion,
     getPreemptionLane,
     isSafeImageUrl,
     normalizeDanmakuMessage,
