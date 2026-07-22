@@ -32,8 +32,13 @@ const {
   getVideoIdFromUrl,
   isValidChatMessagePayload,
   normalizeSettings,
+  parseChatReplayTimestamp,
   YouTubeDanmakuApp
 } = context.YTDanmakuExtension;
+
+assert.equal(parseChatReplayTimestamp('4:03:01'), 14581, '回放聊天时间应解析为视频秒数');
+assert.equal(parseChatReplayTimestamp('03:01'), 181, '短于一小时的回放时间也应正确解析');
+assert.equal(parseChatReplayTimestamp('直播中'), null, '非回放时间文本不应被误解析');
 
 assert.equal(
   getVideoIdFromUrl('https://www.youtube.com/watch?v=current-video&t=30'),
@@ -214,6 +219,33 @@ assert.ok(
 );
 assert.equal(replayRefreshApp.chatRefreshPending, false, '完成同步后应清除等待状态');
 
+const timelineSyncApp = new YouTubeDanmakuApp();
+let timelineRebuilds = 0;
+timelineSyncApp.video = { currentTime: 100, playbackRate: 2 };
+timelineSyncApp.rebuildDanmakuTimeline = () => {
+  timelineRebuilds += 1;
+};
+timelineSyncApp.recordMediaTimeObservation(1000);
+timelineSyncApp.video.currentTime = 102;
+assert.equal(
+  timelineSyncApp.handleMediaTimeUpdate(2000),
+  false,
+  '二倍速下正常推进的媒体时间不应被误判为跳转'
+);
+timelineSyncApp.video.currentTime = 112;
+assert.equal(
+  timelineSyncApp.handleMediaTimeUpdate(2100),
+  true,
+  '漏发 seeked 时大幅快进仍应触发时间轴重建'
+);
+timelineSyncApp.video.currentTime = 80;
+assert.equal(
+  timelineSyncApp.handleMediaTimeUpdate(2200),
+  true,
+  '漏发 seeked 时快退仍应触发时间轴重建'
+);
+assert.equal(timelineRebuilds, 2, '每次检测到时间轴跳变都应重建一次弹幕');
+
 const navigationApp = new YouTubeDanmakuApp();
 navigationApp.player = player;
 navigationApp.videoId = 'previous-video';
@@ -328,6 +360,15 @@ assert.equal(
 );
 assert.equal(
   isValidChatMessagePayload({
+    id: 'invalid-video-time',
+    videoTime: 'not-a-time',
+    segments: [{ type: 'text', text: '无效时间' }]
+  }),
+  false,
+  '无效回放时间不应进入弹幕引擎'
+);
+assert.equal(
+  isValidChatMessagePayload({
     id: 'bridge-payload',
     videoId: 'next-video',
     text: '带表情的合法评论',
@@ -344,6 +385,30 @@ assert.equal(
   true,
   '聊天 iframe 实际转发的文本、表情和颜色字段应通过负载校验'
 );
+
+const replayTimingApp = new YouTubeDanmakuApp();
+replayTimingApp.video = { currentTime: 100 };
+const replayScheduled = [];
+replayTimingApp.engine = {
+  enqueueDeferred(message) {
+    replayScheduled.push(message);
+  }
+};
+replayTimingApp.handleChatMessage({
+  id: 'hydrated-old-message',
+  videoTime: 90,
+  text: '重新加载时注入的旧评论',
+  segments: [{ type: 'text', text: '重新加载时注入的旧评论' }]
+});
+assert.equal(replayTimingApp.timelineMessages.length, 1, '旧回放评论仍应保留供时间轴重建');
+assert.equal(replayScheduled.length, 0, '明显过时的回放评论不应在重新加载时批量起跑');
+replayTimingApp.handleChatMessage({
+  id: 'current-replay-message',
+  videoTime: 98,
+  text: '当前评论',
+  segments: [{ type: 'text', text: '当前评论' }]
+});
+assert.equal(replayScheduled.length, 1, '接近当前播放时间的评论应进入延后生成队列');
 
 messageApp.videoId = 'previous-video';
 handledMessage = null;

@@ -87,6 +87,7 @@
     });
     document.querySelector('#mock-rate').addEventListener('click', (event) => {
       mockPlaybackRate = mockPlaybackRate === 1 ? 2 : 1;
+      app.engine.setPlaybackRate(mockPlaybackRate);
       event.currentTarget.textContent = mockPlaybackRate === 1 ? '模拟 2×' : '恢复 1×';
     });
     document.querySelector('#mock-seek-back').addEventListener('click', () => {

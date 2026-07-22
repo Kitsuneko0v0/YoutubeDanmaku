@@ -24,7 +24,40 @@
   const FIXED_MERGE_MAX_LANES = 3;
   const REPEAT_COUNTER_PULSE_SECONDS = 0.32;
   const MAX_MESSAGES_PER_FRAME = 4;
+  const MAX_MESSAGES_PER_ANIMATION_FRAME = 1;
+  const MAX_EMOJI_REBUILDS_PER_FRAME = 4;
+  const MAX_PENDING_NORMAL_MESSAGES = 300;
   const MESSAGE_DRAIN_BUDGET_MS = 3;
+  const DIAGNOSTICS_PUBLISH_INTERVAL_MS = 500;
+
+  function createDiagnostics() {
+    return {
+      enqueueAttempts: 0,
+      accepted: 0,
+      rejected: 0,
+      spawned: 0,
+      merged: 0,
+      deferred: 0,
+      expired: 0,
+      overflowed: 0,
+      frames: 0,
+      frameIntervals: 0,
+      totalFrameGapMs: 0,
+      maxFrameGapMs: 0,
+      frameGapsOver25Ms: 0,
+      frameGapsOver50Ms: 0,
+      frameGapsOver100Ms: 0,
+      totalFrameWorkMs: 0,
+      maxFrameWorkMs: 0,
+      frameWorkOver4Ms: 0,
+      frameWorkOver8Ms: 0,
+      frameWorkOver16Ms: 0,
+      pauseTransitions: 0,
+      resumeTransitions: 0,
+      resumeFirstFrames: 0,
+      maxResumeFirstFrameDeltaMs: 0
+    };
+  }
 
   function isSafeImageUrl(value) {
     if (!value || typeof value !== 'string') return false;
@@ -104,9 +137,23 @@
     return (Math.max(0, width) + Math.max(0, itemWidth)) / lifetime;
   }
 
-  function calculateBilibiliDanmakuX(stageWidth, danmakuWidth, duration, currentTime, startTime) {
+  function normalizePlaybackRate(value) {
+    const rate = Number(value);
+    return Number.isFinite(rate) && rate > 0 ? rate : 1;
+  }
+
+  function calculateBilibiliDanmakuX(
+    stageWidth,
+    danmakuWidth,
+    duration,
+    currentTime,
+    startTime,
+    playbackRate = 1
+  ) {
     const velocity = getBilibiliDanmakuVelocity(stageWidth, danmakuWidth, duration);
-    return calculateDanmakuX(stageWidth, velocity, currentTime, startTime);
+    const mediaDelta = currentTime - startTime;
+    const presentationTime = startTime + mediaDelta / normalizePlaybackRate(playbackRate);
+    return calculateDanmakuX(stageWidth, velocity, presentationTime, startTime);
   }
 
   function willDanmakuCollide(first, second, gap) {
@@ -216,6 +263,10 @@
       this.lastForcedPriorityTime = 0;
       this.nextId = 1;
       this.mediaClock = null;
+      this.playbackRate = 1;
+      this.diagnostics = createDiagnostics();
+      this.lastDiagnosticsPublishTime = 0;
+      this.awaitingResumeFirstFrame = false;
       this.timeline = [];
       this.timelineCursor = 0;
       this.imageCache = new Map();
@@ -264,8 +315,16 @@
       const nextPaused = Boolean(paused);
       if (this.paused === nextPaused) return;
       this.paused = nextPaused;
+      if (nextPaused) {
+        this.diagnostics.pauseTransitions += 1;
+        this.awaitingResumeFirstFrame = false;
+      } else {
+        this.diagnostics.resumeTransitions += 1;
+        this.awaitingResumeFirstFrame = true;
+      }
       this.lastFrameTime = null;
       this.syncAnimationLoop();
+      this.publishDiagnostics(true);
     }
 
     setMediaClock(mediaClock) {
@@ -274,43 +333,111 @@
       this.syncToMediaTime();
     }
 
+    setPlaybackRate(playbackRate) {
+      this.playbackRate = normalizePlaybackRate(playbackRate);
+    }
+
     getMediaTime() {
       if (!this.mediaClock) return null;
       const time = Number(this.mediaClock());
       return Number.isFinite(time) ? time : null;
     }
 
+    queueNormalMessage(queue, message) {
+      this.pruneExpiredQueueHead(queue);
+      queue.push(message);
+      if (queue.length > MAX_PENDING_NORMAL_MESSAGES) {
+        const overflowed = queue.length - MAX_PENDING_NORMAL_MESSAGES;
+        queue.splice(0, overflowed);
+        this.diagnostics.overflowed += overflowed;
+      }
+    }
+
+    markDeferred(message) {
+      if (!message || message.__ydDeferred) return;
+      message.__ydDeferred = true;
+      message.__ydSpawnAtEntry = true;
+      this.diagnostics.deferred += 1;
+    }
+
+    publishDiagnostics(force = false, now = performance.now()) {
+      const currentTime = Number(now);
+      if (
+        !force
+        && Number.isFinite(currentTime)
+        && currentTime - this.lastDiagnosticsPublishTime < DIAGNOSTICS_PUBLISH_INTERVAL_MS
+      ) return;
+      if (Number.isFinite(currentTime)) this.lastDiagnosticsPublishTime = currentTime;
+
+      const frameSeconds = this.diagnostics.totalFrameGapMs / 1000;
+      this.stage.dataset.diagnostics = JSON.stringify({
+        ...this.diagnostics,
+        averageFps: frameSeconds > 0
+          ? this.diagnostics.frameIntervals / frameSeconds
+          : 0,
+        averageFrameWorkMs: this.diagnostics.frames > 0
+          ? this.diagnostics.totalFrameWorkMs / this.diagnostics.frames
+          : 0,
+        active: this.active.length,
+        fixedActive: this.fixedActive.length,
+        queuedNormal: this.normalQueue.length + this.incomingNormalQueue.length,
+        queuedPriority: this.priorityQueue.length + this.incomingPriorityQueue.length
+      });
+    }
+
     enqueue(message) {
-      if (!message) return false;
+      this.diagnostics.enqueueAttempts += 1;
+      if (!message) {
+        this.diagnostics.rejected += 1;
+        return false;
+      }
       const normalized = normalizeDanmakuMessage(message, this.getMediaTime());
-      if (!normalized) return false;
+      if (!normalized) {
+        this.diagnostics.rejected += 1;
+        return false;
+      }
+      this.diagnostics.accepted += 1;
 
       if (!this.enabled || this.paused) {
         if (normalized.protected) {
           this.priorityQueue.push(normalized);
         } else {
-          this.normalQueue.push(normalized);
-          if (this.normalQueue.length > 100) this.normalQueue.shift();
+          this.markDeferred(normalized);
+          this.queueNormalMessage(this.normalQueue, normalized);
         }
         return true;
       }
 
       const spawned = this.trySpawn(normalized);
-      if (!spawned && normalized.protected) this.priorityQueue.push(normalized);
-      return spawned || normalized.protected;
+      if (!spawned) {
+        if (normalized.protected) this.priorityQueue.push(normalized);
+        else {
+          this.markDeferred(normalized);
+          this.queueNormalMessage(this.normalQueue, normalized);
+        }
+      }
+      return true;
     }
 
     enqueueDeferred(message) {
-      if (!message) return false;
+      this.diagnostics.enqueueAttempts += 1;
+      if (!message) {
+        this.diagnostics.rejected += 1;
+        return false;
+      }
       const normalized = normalizeDanmakuMessage(message, this.getMediaTime());
-      if (!normalized) return false;
+      if (!normalized) {
+        this.diagnostics.rejected += 1;
+        return false;
+      }
+      this.diagnostics.accepted += 1;
+      this.markDeferred(normalized);
 
       if (!this.enabled || this.paused) {
         if (normalized.protected) {
           this.priorityQueue.push(normalized);
         } else {
-          this.normalQueue.push(normalized);
-          if (this.normalQueue.length > 100) this.normalQueue.shift();
+          this.queueNormalMessage(this.normalQueue, normalized);
         }
         return true;
       }
@@ -318,8 +445,7 @@
       if (normalized.protected) {
         this.incomingPriorityQueue.push(normalized);
       } else {
-        this.incomingNormalQueue.push(normalized);
-        if (this.incomingNormalQueue.length > 100) this.incomingNormalQueue.shift();
+        this.queueNormalMessage(this.incomingNormalQueue, normalized);
       }
       if (!this.inAnimationFrame) this.syncAnimationLoop();
       return true;
@@ -381,7 +507,9 @@
       const duration = getBilibiliDanmakuDuration(stageWidth, this.options.speed);
       const velocity = getBilibiliDanmakuVelocity(stageWidth, layout.width, duration);
       const currentMediaTime = this.getMediaTime();
-      const startTime = Number.isFinite(Number(message.videoTime))
+      const startTime = message.__ydSpawnAtEntry && currentMediaTime != null
+        ? currentMediaTime
+        : Number.isFinite(Number(message.videoTime))
         ? Number(message.videoTime)
         : currentMediaTime;
       const spawnX = currentMediaTime == null || startTime == null
@@ -391,7 +519,8 @@
           layout.width,
           duration,
           currentMediaTime,
-          startTime
+          startTime,
+          this.playbackRate
         );
 
       if (spawnX > stageWidth + 1) return false;
@@ -442,6 +571,7 @@
       };
 
       this.active.push(item);
+      this.diagnostics.spawned += 1;
       this.registerEmojiItem(item);
       if (duplicateKey) {
         const group = this.repeatGroups.get(duplicateKey);
@@ -476,7 +606,7 @@
         || !(stageWidth > 0)
       ) return false;
       const duration = getBilibiliDanmakuDuration(stageWidth, this.options.speed);
-      return currentTime - messageTime >= duration;
+      return (currentTime - messageTime) / normalizePlaybackRate(this.playbackRate) >= duration;
     }
 
     pruneExpiredQueueHead(queue, currentTime = this.getMediaTime()) {
@@ -487,7 +617,10 @@
       ) {
         expiredCount += 1;
       }
-      if (expiredCount) queue.splice(0, expiredCount);
+      if (expiredCount) {
+        queue.splice(0, expiredCount);
+        this.diagnostics.expired += expiredCount;
+      }
       return expiredCount;
     }
 
@@ -519,9 +652,12 @@
       }
 
       const currentMediaTime = this.getMediaTime();
-      const restoredAge = currentMediaTime == null
+      const restoredAge = message.__ydSpawnAtEntry || currentMediaTime == null
         ? 0
-        : Math.max(0, currentMediaTime - messageTime);
+        : Math.max(
+          0,
+          (currentMediaTime - messageTime) / normalizePlaybackRate(this.playbackRate)
+        );
       if (restoredAge >= mergeDuration) {
         if (group.fixedItem) this.removeFixedItem(group.fixedItem);
         this.repeatGroups.delete(duplicateKey);
@@ -529,6 +665,7 @@
       }
 
       if (fixedIsActive) {
+        this.diagnostics.merged += 1;
         group.repeatCount += 1;
         group.fixedItem.repeatCount = group.repeatCount;
         group.fixedItem.counterSurface = this.createRepeatCounterSurface(group.repeatCount);
@@ -566,6 +703,7 @@
       };
       group.fixedItem = fixedItem;
       this.fixedActive.push(fixedItem);
+      this.diagnostics.merged += 1;
       this.registerEmojiItem(fixedItem);
       this.requestRender();
       return true;
@@ -657,7 +795,7 @@
         }
         rebuilt += 1;
         if (
-          rebuilt >= MAX_MESSAGES_PER_FRAME
+          rebuilt >= MAX_EMOJI_REBUILDS_PER_FRAME
           || performance.now() - startedAt >= MESSAGE_DRAIN_BUDGET_MS
         ) break;
       }
@@ -1110,7 +1248,7 @@
       const visibleLookback = getBilibiliDanmakuDuration(
         this.stage.clientWidth,
         this.options.speed
-      );
+      ) * normalizePlaybackRate(this.playbackRate);
       this.timeline
         .slice(0, this.timelineCursor)
         .filter((message) => message.videoTime >= targetTime - visibleLookback)
@@ -1149,7 +1287,8 @@
           item.width,
           item.duration,
           currentTime,
-          item.startTime
+          item.startTime,
+          this.playbackRate
         );
         if (item.x > stageWidth + 1 || item.x + item.width < 0) {
           this.removeItem(item);
@@ -1181,9 +1320,9 @@
         && attempts < maxMessages
         && (attempts === 0 || performance.now() - startedAt < MESSAGE_DRAIN_BUDGET_MS)
       ) {
-        const message = this.normalQueue.shift();
         attempts += 1;
-        if (!this.trySpawn(message)) break;
+        if (!this.trySpawn(this.normalQueue[0])) break;
+        this.normalQueue.shift();
       }
       return attempts;
     }
@@ -1202,19 +1341,29 @@
           || performance.now() - startedAt < MESSAGE_DRAIN_BUDGET_MS
         )
       ) {
-        const message = this.incomingPriorityQueue.length
-          ? this.incomingPriorityQueue.shift()
-          : this.incomingNormalQueue.shift();
+        const sourceQueue = this.incomingPriorityQueue.length
+          ? this.incomingPriorityQueue
+          : this.incomingNormalQueue;
+        const message = sourceQueue[0];
         if (this.isMessageExpired(message)) {
+          sourceQueue.shift();
+          this.diagnostics.expired += 1;
           attempts += 1;
           continue;
         }
         const spawned = this.trySpawn(message);
         attempts += 1;
-        if (!spawned && message.protected) {
+        if (spawned) {
+          sourceQueue.shift();
+          continue;
+        }
+        if (message.protected) {
+          sourceQueue.shift();
           this.priorityQueue.push(message);
           break;
         }
+        this.markDeferred(message);
+        break;
       }
       return attempts;
     }
@@ -1223,9 +1372,31 @@
       this.frameId = null;
       if (!this.enabled || this.paused) return;
 
-      const delta = this.lastFrameTime == null
+      const frameWorkStartedAt = performance.now();
+      const rawFrameGapMs = this.lastFrameTime == null
         ? 0
-        : Math.min(0.05, (timestamp - this.lastFrameTime) / 1000);
+        : Math.max(0, timestamp - this.lastFrameTime);
+      const delta = Math.min(0.05, rawFrameGapMs / 1000);
+      this.diagnostics.frames += 1;
+      if (this.lastFrameTime != null) {
+        this.diagnostics.frameIntervals += 1;
+        this.diagnostics.totalFrameGapMs += rawFrameGapMs;
+        this.diagnostics.maxFrameGapMs = Math.max(
+          this.diagnostics.maxFrameGapMs,
+          rawFrameGapMs
+        );
+        if (rawFrameGapMs > 25) this.diagnostics.frameGapsOver25Ms += 1;
+        if (rawFrameGapMs > 50) this.diagnostics.frameGapsOver50Ms += 1;
+        if (rawFrameGapMs > 100) this.diagnostics.frameGapsOver100Ms += 1;
+      }
+      if (this.awaitingResumeFirstFrame) {
+        this.diagnostics.resumeFirstFrames += 1;
+        this.diagnostics.maxResumeFirstFrameDeltaMs = Math.max(
+          this.diagnostics.maxResumeFirstFrameDeltaMs,
+          delta * 1000
+        );
+        this.awaitingResumeFirstFrame = false;
+      }
       this.lastFrameTime = timestamp;
       const currentMediaTime = this.getMediaTime();
 
@@ -1252,10 +1423,10 @@
         }
 
         const drainStartedAt = performance.now();
-        const drained = this.drainQueues(MAX_MESSAGES_PER_FRAME, drainStartedAt);
-        if (!this.priorityQueue.length && drained < MAX_MESSAGES_PER_FRAME) {
+        const drained = this.drainQueues(MAX_MESSAGES_PER_ANIMATION_FRAME, drainStartedAt);
+        if (!this.priorityQueue.length && drained < MAX_MESSAGES_PER_ANIMATION_FRAME) {
           this.drainIncomingMessages(
-            MAX_MESSAGES_PER_FRAME - drained,
+            MAX_MESSAGES_PER_ANIMATION_FRAME - drained,
             drainStartedAt,
             drained === 0
           );
@@ -1265,6 +1436,16 @@
       }
 
       this.renderFrame();
+      const frameWorkMs = performance.now() - frameWorkStartedAt;
+      this.diagnostics.totalFrameWorkMs += frameWorkMs;
+      this.diagnostics.maxFrameWorkMs = Math.max(
+        this.diagnostics.maxFrameWorkMs,
+        frameWorkMs
+      );
+      if (frameWorkMs > 4) this.diagnostics.frameWorkOver4Ms += 1;
+      if (frameWorkMs > 8) this.diagnostics.frameWorkOver8Ms += 1;
+      if (frameWorkMs > 16) this.diagnostics.frameWorkOver16Ms += 1;
+      this.publishDiagnostics(false, timestamp);
       this.frameId = requestAnimationFrame(this.tick);
     }
 

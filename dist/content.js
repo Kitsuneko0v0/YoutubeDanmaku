@@ -19,6 +19,7 @@
     strokeWidth: 2
   });
   const SETTINGS_SAVE_DELAY_MS = 250;
+  const CHAT_REPLAY_LATE_TOLERANCE_SECONDS = 3;
   const FONT_FAMILIES = new Set([
     'sans-serif',
     'Arial, sans-serif',
@@ -103,6 +104,16 @@
     };
   }
 
+  function parseChatReplayTimestamp(value) {
+    if (typeof value !== 'string') return null;
+    const parts = value.trim().split(':');
+    if (parts.length < 2 || parts.length > 3) return null;
+    const numbers = parts.map((part) => Number(part));
+    if (numbers.some((part) => !Number.isInteger(part) || part < 0)) return null;
+    if (numbers.slice(1).some((part) => part >= 60)) return null;
+    return numbers.reduce((total, part) => total * 60 + part, 0);
+  }
+
   function isValidChatMessagePayload(payload) {
     if (!payload || typeof payload !== 'object') return false;
     if (
@@ -116,6 +127,10 @@
         typeof payload.videoId !== 'string'
         || payload.videoId.length > CHAT_MESSAGE_LIMITS.videoId
       )
+    ) return false;
+    if (
+      payload.videoTime != null
+      && (!Number.isFinite(Number(payload.videoTime)) || Number(payload.videoTime) < 0)
     ) return false;
     if (
       payload.text != null
@@ -321,6 +336,9 @@
       const color = isPaid
         ? nodeStyle.getPropertyValue('--yt-live-chat-paid-message-primary-color').trim()
         : '#ffffff';
+      const videoTime = parseChatReplayTimestamp(
+        node.querySelector('#timestamp')?.textContent || ''
+      );
 
       window.top.postMessage({
         source: MESSAGE_SOURCE,
@@ -328,6 +346,7 @@
         payload: {
           id,
           videoId: getCurrentVideoId(),
+          videoTime,
           text,
           segments,
           role,
@@ -366,6 +385,8 @@
       this.seenMessages = new Set();
       this.timelineMessages = [];
       this.pendingMessages = [];
+      this.lastObservedMediaTime = null;
+      this.lastObservedMediaAt = null;
       this.handleWindowMessage = this.handleWindowMessage.bind(this);
       this.scheduleMount = this.scheduleMount.bind(this);
     }
@@ -437,8 +458,10 @@
 
       this.engine = new globalThis.YTDanmakuCore.DanmakuEngine(this.stage, this.toEngineOptions());
       this.engine.setMediaClock(() => this.video?.currentTime);
+      this.engine.setPlaybackRate(video.playbackRate);
       this.engine.setEnabled(this.settings.enabled);
       this.engine.setPaused(video.paused);
+      this.recordMediaTimeObservation();
       this.flushPendingMessages(videoId);
       this.updateChatVisibility();
 
@@ -449,10 +472,23 @@
       video.addEventListener('pause', () => this.engine?.setPaused(true), { signal });
       video.addEventListener('waiting', () => this.engine?.setPaused(true), { signal });
       video.addEventListener('ended', () => this.engine?.setPaused(true), { signal });
-      video.addEventListener('seeking', () => this.engine?.syncToMediaTime(), { signal });
-      video.addEventListener('seeked', () => this.rebuildDanmakuTimeline(), { signal });
+      video.addEventListener('ratechange', () => {
+        this.engine?.setPlaybackRate(video.playbackRate);
+        this.recordMediaTimeObservation();
+      }, { signal });
+      video.addEventListener('seeking', () => {
+        this.engine?.syncToMediaTime();
+      }, { signal });
+      video.addEventListener('seeked', () => {
+        this.rebuildDanmakuTimeline();
+        this.recordMediaTimeObservation();
+      }, { signal });
       video.addEventListener('timeupdate', () => {
-        if (video.seeking) this.engine?.syncToMediaTime();
+        if (video.seeking) {
+          this.engine?.syncToMediaTime();
+          return;
+        }
+        this.handleMediaTimeUpdate();
       }, { signal });
       document.addEventListener('pointerdown', (event) => {
         if (this.panel?.hidden) return;
@@ -815,6 +851,11 @@
       };
       this.timelineMessages.push(timedMessage);
       if (this.timelineMessages.length > 4000) this.timelineMessages.shift();
+      if (
+        hasVideoTime
+        && Number.isFinite(currentTime)
+        && parsedVideoTime < currentTime - CHAT_REPLAY_LATE_TOLERANCE_SECONDS
+      ) return;
       if (typeof this.engine?.enqueueDeferred === 'function') {
         this.engine.enqueueDeferred(timedMessage);
       } else {
@@ -826,6 +867,35 @@
       const currentTime = Number(this.video?.currentTime);
       if (!Number.isFinite(currentTime)) return;
       this.engine?.rebuildAtTime(this.timelineMessages, currentTime);
+    }
+
+    recordMediaTimeObservation(observedAt = performance.now()) {
+      const currentTime = Number(this.video?.currentTime);
+      this.lastObservedMediaTime = Number.isFinite(currentTime) ? currentTime : null;
+      this.lastObservedMediaAt = Number.isFinite(Number(observedAt)) ? Number(observedAt) : null;
+    }
+
+    handleMediaTimeUpdate(observedAt = performance.now()) {
+      const currentTime = Number(this.video?.currentTime);
+      const wallTime = Number(observedAt);
+      if (!Number.isFinite(currentTime) || !Number.isFinite(wallTime)) return false;
+
+      let discontinuity = false;
+      if (
+        Number.isFinite(this.lastObservedMediaTime)
+        && Number.isFinite(this.lastObservedMediaAt)
+      ) {
+        const mediaDelta = currentTime - this.lastObservedMediaTime;
+        const wallDelta = Math.max(0, (wallTime - this.lastObservedMediaAt) / 1000);
+        const playbackRate = Math.max(0.01, Number(this.video?.playbackRate) || 1);
+        const expectedAdvance = wallDelta * playbackRate;
+        discontinuity = mediaDelta < -0.5 || mediaDelta > expectedAdvance + 1.5;
+      }
+
+      this.lastObservedMediaTime = currentTime;
+      this.lastObservedMediaAt = wallTime;
+      if (discontinuity) this.rebuildDanmakuTimeline();
+      return discontinuity;
     }
 
     unmountPlayer() {
@@ -849,6 +919,8 @@
       this.player = null;
       this.video = null;
       this.videoId = '';
+      this.lastObservedMediaTime = null;
+      this.lastObservedMediaAt = null;
       this.seenMessages.clear();
       this.timelineMessages = [];
     }
@@ -863,7 +935,8 @@
     extractText,
     getVideoIdFromUrl,
     isValidChatMessagePayload,
-    normalizeSettings
+    normalizeSettings,
+    parseChatReplayTimestamp
   };
 
   if (window.top !== window) {
