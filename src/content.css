@@ -40,6 +40,8 @@ html.yd-hide-chat-in-fullscreen ytd-watch-grid[fullscreen][live-chat-present-and
 
 html.yd-hide-chat-in-fullscreen ytd-watch-flexy[fullscreen][live-chat-present-and-expanded] #player-full-bleed-container,
 html.yd-hide-chat-in-fullscreen ytd-watch-grid[fullscreen][live-chat-present-and-expanded] #player-full-bleed-container {
+  background: #000 !important;
+  box-shadow: 0 0 0 100vmax #000 !important;
   position: relative !important;
   z-index: 1 !important;
 }
@@ -183,6 +185,85 @@ html.yd-hide-chat-in-fullscreen ytd-watch-grid[fullscreen][live-chat-present-and
   margin: 0 8px 6px;
   min-height: 36px;
   padding: 0 0 6px;
+  position: relative;
+}
+
+.yd-setting-label-with-help {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.yd-setting-help {
+  align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: rgba(238, 238, 238, 0.58);
+  cursor: help;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 18px;
+  justify-content: center;
+  padding: 0;
+  width: 18px;
+}
+
+.yd-setting-help-icon {
+  align-items: center;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  box-sizing: border-box;
+  display: inline-flex;
+  font-size: 10px;
+  font-weight: 700;
+  height: 14px;
+  justify-content: center;
+  line-height: 1;
+  width: 14px;
+}
+
+.yd-setting-help:hover,
+.yd-setting-help:focus-visible {
+  color: #fff;
+  outline: none;
+}
+
+.yd-setting-help:focus-visible .yd-setting-help-icon {
+  outline: 2px solid #3ea6ff;
+  outline-offset: 2px;
+}
+
+.yd-setting-tooltip {
+  background: #282828;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 400;
+  left: 0;
+  line-height: 1.45;
+  opacity: 0;
+  padding: 8px 9px;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  text-align: left;
+  top: calc(100% + 4px);
+  transform: translateY(-4px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+  visibility: hidden;
+  white-space: normal;
+  z-index: 80;
+}
+
+.yd-setting-help:hover .yd-setting-tooltip,
+.yd-setting-help:focus-visible .yd-setting-tooltip {
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
 }
 
 .yd-switch {
@@ -346,7 +427,8 @@ html.yd-hide-chat-in-fullscreen ytd-watch-grid[fullscreen][live-chat-present-and
   .yd-settings-panel,
   .yd-control-button,
   .yd-switch-track,
-  .yd-switch-track::after {
+  .yd-switch-track::after,
+  .yd-setting-tooltip {
     transition: none !important;
   }
 }

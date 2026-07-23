@@ -19,6 +19,14 @@ assert.equal(createTranslator('ja-JP')('settingsTitle'), '弾幕設定');
 assert.equal(createTranslator('ko-KR')('settingsTitle'), '탄막 설정');
 assert.equal(createTranslator('en-US')('settingsTitle'), 'Danmaku settings');
 assert.equal(createTranslator('zh-CN')('hideChatInFullscreen'), '全屏时隐藏评论栏');
+assert.equal(createTranslator('zh-CN')('cleanTimeParameter'), '时间链接 (beta)');
+assert.equal(createTranslator('en-US')('cleanTimeParameter'), 'Time links (beta)');
+assert.equal(createTranslator('ja-JP')('cleanTimeParameter'), '時間リンク (beta)');
+assert.equal(createTranslator('ko-KR')('cleanTimeParameter'), '시간 링크 (beta)');
+assert.match(createTranslator('zh-CN')('cleanTimeParameterDescription'), /刷新/);
+assert.match(createTranslator('en-US')('cleanTimeParameterDescription'), /refreshes/);
+assert.match(createTranslator('ja-JP')('cleanTimeParameterDescription'), /更新/);
+assert.match(createTranslator('ko-KR')('cleanTimeParameterDescription'), /새로고침/);
 assert.equal(
   createTranslator('fr-FR')('enableDanmaku'),
   'Enable danmaku',

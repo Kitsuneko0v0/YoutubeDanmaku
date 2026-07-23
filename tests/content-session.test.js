@@ -30,16 +30,28 @@ vm.runInContext(source, context, { filename: 'content.js' });
 
 const {
   ChatFrameBridge,
+  DEFAULT_SETTINGS,
+  getCleanTimeParameterNavigation,
   getVideoIdFromUrl,
   isValidChatMessagePayload,
   normalizeSettings,
   parseChatReplayTimestamp,
+  parseTimeParameter,
   YouTubeDanmakuApp
 } = context.YTDanmakuExtension;
 
+assert.equal(DEFAULT_SETTINGS.cleanTimeParameter, false, '时间链接功能应默认关闭');
 assert.equal(parseChatReplayTimestamp('4:03:01'), 14581, '回放聊天时间应解析为视频秒数');
 assert.equal(parseChatReplayTimestamp('03:01'), 181, '短于一小时的回放时间也应正确解析');
 assert.equal(parseChatReplayTimestamp('直播中'), null, '非回放时间文本不应被误解析');
+assert.equal(parseTimeParameter('21620s'), 21620, '秒数形式的 t 参数应正确解析');
+assert.equal(parseTimeParameter('6h0m20s'), 21620, '时分秒形式的 t 参数应正确解析');
+assert.equal(parseTimeParameter('invalid'), null, '无效的 t 参数不应触发链接清理');
+assert.match(
+  source,
+  /class="yd-setting-help"[^>]+aria-describedby="yd-clean-time-parameter-tooltip"/,
+  '时间链接说明图标应通过可访问描述关联提示内容'
+);
 assert.match(
   source,
   /this\.observer\.observe\(list, \{ childList: true, subtree: false \}\)/,
@@ -186,6 +198,62 @@ assert.equal(
 );
 assert.equal(getVideoIdFromUrl('http://[invalid'), '', '无效 URL 不应产生视频 ID');
 
+const cleanTimeNavigation = getCleanTimeParameterNavigation(
+  'https://www.youtube.com/watch?v=time-video&t=21620s&list=playlist#details'
+);
+assert.equal(cleanTimeNavigation.seconds, 21620, '时间链接应保留原始目标进度');
+assert.equal(cleanTimeNavigation.videoId, 'time-video', '时间链接应绑定原视频 ID');
+const cleanedTimeUrl = new URL(cleanTimeNavigation.url);
+assert.equal(cleanedTimeUrl.searchParams.has('t'), false, '清理后的链接不应继续携带 t 参数');
+assert.equal(cleanedTimeUrl.searchParams.get('v'), 'time-video', '清理后的链接应保留原视频');
+assert.equal(cleanedTimeUrl.searchParams.get('list'), 'playlist', '清理后的链接应保留其他参数');
+assert.equal(cleanedTimeUrl.hash, '#details', '清理后的链接应保留锚点');
+assert.equal(
+  getCleanTimeParameterNavigation('https://www.youtube.com/watch?v=time-video&t=invalid'),
+  null,
+  '无效时间参数不应改写链接'
+);
+
+const replacedTimeUrls = [];
+context.history = {
+  state: { source: 'test' },
+  replaceState(state, title, url) {
+    replacedTimeUrls.push({ state, title, url });
+  }
+};
+location.pathname = '/watch';
+location.href = 'https://www.youtube.com/watch?v=time-video&t=21620s&list=playlist';
+const timeParameterApp = new YouTubeDanmakuApp();
+timeParameterApp.settings.cleanTimeParameter = true;
+timeParameterApp.videoId = 'time-video';
+timeParameterApp.video = { currentTime: 0, duration: 30000, readyState: 1 };
+timeParameterApp.recordMediaTimeObservation = () => {};
+assert.equal(timeParameterApp.captureTimeParameterSeek(), true, '开启功能后应立即处理有效时间链接');
+assert.equal(timeParameterApp.video.currentTime, 21620, '清理参数后应通过视频时间完成跳转');
+assert.equal(replacedTimeUrls.length, 1, '有效时间链接应只改写一次历史记录');
+assert.equal(new URL(replacedTimeUrls[0].url).searchParams.has('t'), false);
+assert.equal(timeParameterApp.pendingTimeParameterSeek, null, '成功跳转后不应重复应用固定时间点');
+
+location.href = 'https://www.youtube.com/watch?v=metadata-video&t=90s';
+const delayedTimeParameterApp = new YouTubeDanmakuApp();
+delayedTimeParameterApp.settings.cleanTimeParameter = true;
+delayedTimeParameterApp.videoId = 'metadata-video';
+delayedTimeParameterApp.video = { currentTime: 0, duration: NaN, readyState: 0 };
+delayedTimeParameterApp.recordMediaTimeObservation = () => {};
+assert.equal(
+  delayedTimeParameterApp.captureTimeParameterSeek(),
+  false,
+  '视频元数据未就绪时应保留待跳转进度'
+);
+assert.equal(delayedTimeParameterApp.video.currentTime, 0, '元数据未就绪前不应提前改写播放时间');
+delayedTimeParameterApp.video.readyState = 1;
+delayedTimeParameterApp.video.duration = 600;
+assert.equal(delayedTimeParameterApp.applyPendingTimeParameterSeek(), true, '元数据就绪后应完成待处理跳转');
+assert.equal(delayedTimeParameterApp.video.currentTime, 90);
+
+location.pathname = '/';
+location.href = 'https://www.youtube.com/';
+
 const rightControls = {};
 const video = {};
 const player = {
@@ -213,6 +281,7 @@ const normalizedSettings = normalizeSettings({
   fontFamily: 'url(https://example.invalid/font)',
   bold: 'false',
   hideChatInFullscreen: 'true',
+  cleanTimeParameter: 'true',
   strokeWidth: 3.7
 });
 assert.equal(normalizedSettings.area, 100, '显示区域应限制在设置面板支持的范围内');
@@ -225,6 +294,16 @@ assert.equal(
   normalizedSettings.hideChatInFullscreen,
   false,
   '非布尔全屏评论栏设置不应被当作已启用'
+);
+assert.equal(
+  normalizedSettings.cleanTimeParameter,
+  false,
+  '非布尔时间链接设置不应被当作已启用'
+);
+assert.equal(
+  normalizeSettings({ cleanTimeParameter: true }).cleanTimeParameter,
+  true,
+  '时间链接功能应保存布尔开关状态'
 );
 assert.equal(normalizedSettings.strokeWidth, 3.5, '描边应按设置面板步长规范化');
 
@@ -277,6 +356,12 @@ const fullscreenPlayerRule = styles.match(
   /html\.yd-hide-chat-in-fullscreen ytd-watch-flexy\[fullscreen]\[live-chat-present-and-expanded] #player-full-bleed-container,\s*html\.yd-hide-chat-in-fullscreen ytd-watch-grid\[fullscreen]\[live-chat-present-and-expanded] #player-full-bleed-container\s*{([^}]*)}/
 )?.[1] || '';
 assert.match(fullscreenPlayerRule, /z-index:\s*1/, '播放器应覆盖仍在视口内运行的评论栏');
+assert.match(fullscreenPlayerRule, /background:\s*#000/, '播放器区域应使用不透明背景遮住评论栏');
+assert.match(
+  fullscreenPlayerRule,
+  /box-shadow:\s*0 0 0 100vmax #000/,
+  '播放器背板应覆盖非 16:9 全屏视口中的上下留黑区域'
+);
 
 const documentClassNames = new Set();
 context.document.documentElement = {

@@ -10,6 +10,7 @@
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     hideChatInFullscreen: false,
+    cleanTimeParameter: false,
     area: 50,
     opacity: 70,
     fontSize: 24,
@@ -75,6 +76,39 @@
     return pathname === '/watch' || /^\/live\/[^/]+\/?$/.test(pathname);
   }
 
+  function parseTimeParameter(value) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (/^\d+(?:\.\d+)?s?$/.test(normalized)) {
+      const seconds = Number(normalized.replace(/s$/, ''));
+      return Number.isFinite(seconds) ? seconds : null;
+    }
+
+    const match = normalized.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$/);
+    if (!match || !match.slice(1).some(Boolean)) return null;
+    const seconds = Number(match[1] || 0) * 3600
+      + Number(match[2] || 0) * 60
+      + Number(match[3] || 0);
+    return Number.isFinite(seconds) ? seconds : null;
+  }
+
+  function getCleanTimeParameterNavigation(value) {
+    try {
+      const url = new URL(value, location.origin);
+      if (!isSupportedVideoPage(url.pathname) || !url.searchParams.has('t')) return null;
+      const seconds = parseTimeParameter(url.searchParams.get('t'));
+      if (seconds == null) return null;
+      url.searchParams.delete('t');
+      return {
+        seconds,
+        videoId: getVideoIdFromUrl(url),
+        url: url.toString()
+      };
+    } catch {
+      return null;
+    }
+  }
+
   function normalizeSteppedNumber(value, fallback, min, max, step) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return fallback;
@@ -92,6 +126,9 @@
       hideChatInFullscreen: typeof settings.hideChatInFullscreen === 'boolean'
         ? settings.hideChatInFullscreen
         : DEFAULT_SETTINGS.hideChatInFullscreen,
+      cleanTimeParameter: typeof settings.cleanTimeParameter === 'boolean'
+        ? settings.cleanTimeParameter
+        : DEFAULT_SETTINGS.cleanTimeParameter,
       area: normalizeSteppedNumber(settings.area, DEFAULT_SETTINGS.area, 25, 100, 25),
       opacity: normalizeSteppedNumber(settings.opacity, DEFAULT_SETTINGS.opacity, 0, 100, 1),
       fontSize: normalizeSteppedNumber(settings.fontSize, DEFAULT_SETTINGS.fontSize, 12, 40, 1),
@@ -567,6 +604,7 @@
       this.chatRefreshPending = false;
       this.settingsSaveTimer = null;
       this.playerWasFullscreen = false;
+      this.pendingTimeParameterSeek = null;
       this.seenMessages = new Set();
       this.timelineMessages = [];
       this.pendingMessages = [];
@@ -598,6 +636,7 @@
     }
 
     scheduleMount() {
+      this.captureTimeParameterSeek();
       if (this.mountTimer != null) return;
       this.mountTimer = setTimeout(() => {
         this.mountTimer = null;
@@ -612,6 +651,10 @@
       }
 
       const videoId = getCurrentVideoId();
+      if (
+        this.pendingTimeParameterSeek
+        && this.pendingTimeParameterSeek.videoId !== videoId
+      ) this.pendingTimeParameterSeek = null;
       if (this.player && this.videoId !== videoId) this.unmountPlayer();
       const player = document.getElementById('movie_player');
       const rightControls = player?.querySelector('.ytp-right-controls');
@@ -631,6 +674,7 @@
       this.videoId = videoId;
       this.abortController = new AbortController();
       const { signal } = this.abortController;
+      video.addEventListener('loadedmetadata', () => this.applyPendingTimeParameterSeek(), { signal });
 
       this.stage = document.createElement('div');
       this.stage.className = 'yd-danmaku-stage';
@@ -648,6 +692,7 @@
       this.engine.setPlaybackRate(video.playbackRate);
       this.engine.setEnabled(this.settings.enabled);
       this.engine.setPaused(video.paused);
+      this.applyPendingTimeParameterSeek();
       this.recordMediaTimeObservation();
       this.flushPendingMessages(videoId);
       this.updateChatVisibility();
@@ -761,6 +806,19 @@
             <span class="yd-switch-track" aria-hidden="true"></span>
           </span>
         </label>
+        <div class="yd-setting-toggle-row">
+          <span class="yd-setting-label-with-help">
+            <label class="yd-setting-label" id="yd-setting-clean-time-parameter-label" for="yd-setting-clean-time-parameter">${this.t('cleanTimeParameter')}</label>
+            <button class="yd-setting-help" type="button" aria-label="${this.t('cleanTimeParameterDescription')}" aria-describedby="yd-clean-time-parameter-tooltip">
+              <span class="yd-setting-help-icon" aria-hidden="true">!</span>
+              <span class="yd-setting-tooltip" id="yd-clean-time-parameter-tooltip" role="tooltip">${this.t('cleanTimeParameterDescription')}</span>
+            </button>
+          </span>
+          <label class="yd-switch" for="yd-setting-clean-time-parameter">
+            <input id="yd-setting-clean-time-parameter" data-setting="cleanTimeParameter" type="checkbox" role="switch" aria-labelledby="yd-setting-clean-time-parameter-label">
+            <span class="yd-switch-track" aria-hidden="true"></span>
+          </label>
+        </div>
         ${this.rangeTemplate('area', this.t('displayArea'), 25, 100, 25, this.settings.area)}
         ${this.rangeTemplate('opacity', this.t('opacity'), 0, 100, 1, this.settings.opacity)}
         ${this.rangeTemplate('fontSize', this.t('fontSize'), 12, 40, 1, this.settings.fontSize)}
@@ -789,6 +847,12 @@
       hideChatInFullscreen.checked = this.settings.hideChatInFullscreen;
       hideChatInFullscreen.addEventListener('change', () => {
         this.updateSetting('hideChatInFullscreen', hideChatInFullscreen.checked);
+        this.saveSettingsNow();
+      });
+      const cleanTimeParameter = panel.querySelector('[data-setting="cleanTimeParameter"]');
+      cleanTimeParameter.checked = this.settings.cleanTimeParameter;
+      cleanTimeParameter.addEventListener('change', () => {
+        this.updateSetting('cleanTimeParameter', cleanTimeParameter.checked);
         this.saveSettingsNow();
       });
       panel.querySelectorAll('.yd-setting-range').forEach((input) => {
@@ -836,6 +900,8 @@
       if (enabled) enabled.checked = this.settings.enabled;
       const hideChatInFullscreen = panel.querySelector('[data-setting="hideChatInFullscreen"]');
       if (hideChatInFullscreen) hideChatInFullscreen.checked = this.settings.hideChatInFullscreen;
+      const cleanTimeParameter = panel.querySelector('[data-setting="cleanTimeParameter"]');
+      if (cleanTimeParameter) cleanTimeParameter.checked = this.settings.cleanTimeParameter;
       panel.querySelectorAll('.yd-setting-range').forEach((input) => {
         const key = input.dataset.setting;
         const value = Number(this.settings[key]);
@@ -853,7 +919,54 @@
       this.scheduleSettingsSave();
       this.engine?.applyOptions(this.toEngineOptions());
       this.updateChatVisibility();
+      if (key === 'cleanTimeParameter') {
+        if (this.settings.cleanTimeParameter) this.captureTimeParameterSeek();
+        else this.pendingTimeParameterSeek = null;
+      }
       this.refreshSettingsPanel(this.panel);
+    }
+
+    captureTimeParameterSeek() {
+      if (!this.settings.cleanTimeParameter) return false;
+      const navigation = getCleanTimeParameterNavigation(location.href);
+      if (!navigation?.videoId) return false;
+
+      try {
+        if (typeof globalThis.history?.replaceState !== 'function') return false;
+        globalThis.history.replaceState(globalThis.history.state, '', navigation.url);
+      } catch {
+        return false;
+      }
+
+      this.pendingTimeParameterSeek = {
+        seconds: navigation.seconds,
+        videoId: navigation.videoId
+      };
+      return this.applyPendingTimeParameterSeek();
+    }
+
+    applyPendingTimeParameterSeek() {
+      const pending = this.pendingTimeParameterSeek;
+      if (
+        !pending
+        || !this.video
+        || pending.videoId !== this.videoId
+        || Number(this.video.readyState) < 1
+      ) return false;
+
+      const duration = Number(this.video.duration);
+      const target = Number.isFinite(duration) && duration > 0
+        ? Math.min(pending.seconds, duration)
+        : pending.seconds;
+      try {
+        this.video.currentTime = Math.max(0, target);
+      } catch {
+        return false;
+      }
+      this.pendingTimeParameterSeek = null;
+      this.engine?.syncToMediaTime();
+      this.recordMediaTimeObservation();
+      return true;
     }
 
     updateChatVisibility() {
@@ -1170,9 +1283,11 @@
     extractMessageSegments,
     extractText,
     getVideoIdFromUrl,
+    getCleanTimeParameterNavigation,
     isValidChatMessagePayload,
     normalizeSettings,
-    parseChatReplayTimestamp
+    parseChatReplayTimestamp,
+    parseTimeParameter
   };
 
   if (window.top !== window) {
